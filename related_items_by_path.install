@@ -1,0 +1,44 @@
+<?php
+
+/**
+ * @file
+ * Install, update and uninstall functions for the Related Items By Path module.
+ */
+
+//hook_requirements
+
+//hook_schema
+
+/**
+ * Implements hook_install.
+ */
+function related_items_by_path_install() {
+  variable_set('related_items_by_path_block_title', 'You may also like');
+  variable_set('related_items_by_path_parent_paths', array());
+  variable_set('related_items_by_path_excluded_pages', array());
+  variable_set('related_items_by_path_show_on_top_level_pages', FALSE);
+  variable_set('related_items_by_path_items_per_block', 4);
+  variable_set('related_items_by_path_show_on_excluded_pages', TRUE);
+  variable_set('related_items_by_path_image_fields', array('field_header_image'));
+  variable_set('related_items_by_path_image_style', 'thumbnail');
+  variable_get('related_items_by_path_cache_time', 1 * 60 * 60);
+}
+
+/**
+ * Implements hook_uninstall.
+ */
+function related_items_by_path_uninstall() {
+  variable_del('related_items_by_path_block_title');
+  variable_del('related_items_by_path_parent_paths');
+  variable_del('related_items_by_path_excluded_pages');
+  variable_del('related_items_by_path_show_on_top_level_pages');
+  variable_del('related_items_by_path_items_per_block');
+  variable_del('related_items_by_path_show_on_excluded_pages');
+  variable_del('related_items_by_path_image_fields');
+  variable_del('related_items_by_path_image_style');
+  variable_del('related_items_by_path_cache_time');
+}
+
+//hook_enable
+
+//hook_disable

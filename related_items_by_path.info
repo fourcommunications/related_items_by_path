@@ -1,0 +1,9 @@
+name = Related Items By Path
+description = Generates a block of content related to the current page by its menu path. You limit content by specifying how far up the menu tree the module should search for content.
+package = Greyhead Customisations
+core = 7.x
+version = 7.x-1.x
+
+;files[] =
+
+dependencies[] = node

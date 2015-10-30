@@ -1,0 +1,903 @@
+<?php
+/**
+ * @file
+ * Generates a block of content related to the current page by its menu path.
+ *
+ * You limit content by specifying how far up the menu tree the module should
+ * search for content.
+ *
+ * @TODO: add checkboxes to each node edit page to allow marking as a section parent, and to allow marking a page for exclusion from results.
+ */
+
+/**
+ * Define a standardised line ending.
+ */
+define('RELATED_ITEMS_BY_PATH_LINE_ENDING', "\n");
+
+/**
+ * Define the default cache time - 1 hour, in seconds.
+ */
+define('RELATED_ITEMS_BY_PATH_CACHE_TIME_DEFAULT', 1 * 60 * 60);
+
+/**
+ * Define the name of the image to be used if we don't have an image available.
+ */
+define('RELATED_ITEMS_BY_PATH_BLANK_IMAGE', 'white-450x400.png');
+
+/**
+ * Also define the name of the image as it should be saved to the files
+ * directory.
+ */
+define('RELATED_ITEMS_BY_PATH_IMAGE_FILESYSTEM_NAME', 'related-items-by-path-' . RELATED_ITEMS_BY_PATH_BLANK_IMAGE);
+
+/**
+ * Implements hook_theme().
+ *
+ * Register the theme function which renders out a list of related nodes.
+ */
+function related_items_by_path_theme($existing, $type, $theme, $path) {
+  return array(
+    'related_items_by_path_items' => array(
+      'template' => 'related-items-by-path--items',
+      'path' => drupal_get_path('module', 'related_items_by_path') . '/templates',
+      'variables' => array('related_items' => NULL),
+    ),
+    'related_items_by_path_item' => array(
+      'template' => 'related-items-by-path--item',
+      'path' => drupal_get_path('module', 'related_items_by_path') . '/templates',
+      'variables' => array(
+        'title' => NULL,
+        'image' => NULL,
+        'summary_text' => NULL,
+        'path' => NULL,
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_block_info().
+ *
+ * This module defines one block whose content will vary on each page.
+ */
+function related_items_by_path_block_info() {
+  $blocks['related_items_by_path'] = array(
+    'info' => t('Related items (based on path)'),
+    'cache' => DRUPAL_CACHE_PER_PAGE,
+    'status' => TRUE,
+    'region' => 'lower_content',
+    'visibility' => BLOCK_VISIBILITY_NOTLISTED,
+    // We implode an array of paths which we don't want to see this block
+    // displayed on, for code readability.
+    'pages' => _related_items_by_path_array_to_string(array(
+      '<front>',
+      'user',
+      'user/*',
+      'users',
+      'users/*',
+    )),
+  );
+
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function related_items_by_path_block_view($delta = '') {
+  $return_array = array();
+
+  if ($delta == 'related_items_by_path') {
+    $items = related_items_by_path_get_related_items();
+
+    if (is_array($items) && !empty($items)) {
+      $return_array = array(
+        // The block title.
+        'subject' => variable_get('related_items_by_path_block_title', 'You may also like'),
+        // The block's content, as a renderableableable array.
+        'content' => array(
+          '#type' => 'container',
+          '#attributes' => array(
+            'class' => array('related-items-by-path'),
+          ),
+          'related_items_by_path_items' => array(
+            '#items' => $items,
+            '#theme' => 'item_list',
+          ),
+        ),
+      );
+    }
+  }
+
+  return $return_array;
+}
+
+/**
+ * Finds up to $count items of content which exist under the same menu item as
+ * the current page's nearest parent path, configured in the admin interface.
+ *
+ * For example, if this page is at foo/bar/monkey/noodle, and the administrator
+ * has set foo/bar as a category parent page, then up to $count nodes which also
+ * have a path beginning foo/bar/ will be returned by this function.
+ * @return array
+ * @throws \Exception
+ * @internal param string $path
+ *
+ */
+function related_items_by_path_get_related_items() {
+  $count = variable_get('related_items_by_path_items_per_block', 4);
+
+  // Statics and caching.
+  $items = &drupal_static(__FUNCTION__, array());
+
+  // Generate the cache ID for this data.
+  $cid = __FUNCTION__ . ':' . str_replace('/', ':', $_GET['q']);
+
+  // Check the cache for this data. If not available, generate it now.
+  $cache_available = FALSE;
+
+  // Set a $node variable.
+  $node = FALSE;
+
+  // Set the current NID if we're on a node, so we can filter it out of any
+  // results.
+  $current_nid = NULL;
+
+  // Are we on a node?
+  if ((arg(0) == 'node') && is_numeric(arg(1))) {
+    $current_nid = arg(1);
+    $node = node_load(arg(1));
+  }
+
+  if ($cache = cache_get($cid)) {
+    $items[$cid] = $cache->data;
+
+    // If we're on a node, check that the cache entry isn't older than the last-
+    // updated time for the node; if the node has been updated since the cache
+    // was generated, we invalidate the cache by recreating the related items,
+    // to avoid seeing stale items.
+    if ($node) {
+      if ($cache->created < $node->updated) {
+        unset($items[$cid]);
+        $cache_available = FALSE;
+      }
+    }
+  }
+
+  if (!$cache_available) {
+    $related_items = $items[$cid] = array();
+
+    // Set a counter which indicates how many manually promoted items have come
+    // from the field_promoted_content field.
+    $manually_promoted_count = 0;
+
+    // Are we on a node?
+    if ($node) {
+      if ($node_promoted_content = field_get_items('node', $node, 'field_promoted_content')) {
+        // The node IDs are in the [n]['target_id'] array key.
+        foreach ($node_promoted_content as $row => $node_promoted_content_row) {
+          // Don't allow this node to link back to itself.
+          if (($node_promoted_content_row['target_id'] != $current_nid)
+            && ($node_promoted_content_node = node_load($node_promoted_content_row['target_id']))
+          ) {
+            $related_items[$node_promoted_content_node->nid] = related_items_by_path_get_related_item_info($node_promoted_content_node);
+          }
+        }
+
+        // Also update the offset counter.
+        $manually_promoted_count = count($related_items);
+      }
+    }
+
+    // If we didn't get enough manually chosen related items, fill the gaps with
+    // randomly-selected items.
+    if ($manually_promoted_count < $count) {
+      $related_items += _related_items_by_path_get_related_items($count - $manually_promoted_count, $current_nid);
+    }
+
+    foreach ($related_items as $related_item) {
+      // Get the title, image, summary text and path for the node and theme it.
+      $themed_item = theme('related_items_by_path_item', array(
+        'title' => $related_item['title'],
+        'image' => $related_item['image'],
+        'summary_text' => $related_item['summary_text'],
+        'path' => $related_item['path'],
+      ));
+
+      $items[$cid][] = $themed_item;
+    }
+
+    // Store the themed results in the cache.
+    cache_set($cid, $items[$cid], 'cache', (REQUEST_TIME + variable_get('related_items_by_path_cache_time', RELATED_ITEMS_BY_PATH_CACHE_TIME_DEFAULT)));
+  }
+
+  return $items[$cid];
+}
+
+/**
+ * Function which performs the search for related items.
+ *
+ * Overview of the function:
+ *
+ * - Get the (aliased) current path
+ *
+ * - (Because the menu is the easiest way for a site owner to visualise how their
+ *   site's sections are laid out, we will default to looking at the current
+ *   page's active menu trail, therefore...)
+ *
+ * - Get the active trail for the current page.
+ *
+ * @param $count      int The number of items to return.
+ *
+ * @param $exclusions int|array The node ID(s) of nodes which should be
+ *                    excluded.
+ *
+ * @return array
+ * @internal param $path
+ */
+function _related_items_by_path_get_related_items($count, $exclusions = NULL) {
+  // If we have exclusions, make sure they're an array.
+  if (!is_null($exclusions) && !is_array($exclusions)) {
+    $exclusions = (array) $exclusions;
+  }
+
+  // Set our current path.
+  $current_path_unaliased = drupal_get_normal_path($_GET['q']);
+  $current_path_aliased = drupal_get_path_alias($current_path_unaliased);
+
+  $related_content_by_path = &drupal_static(__FUNCTION__);
+
+  if (!isset($related_content_by_path) || !is_array($related_content_by_path)) {
+    $related_content_by_path = array();
+  }
+
+  // Do we already have a cached set of results for this page?
+  if (!array_key_exists($current_path_unaliased, $related_content_by_path)) {
+    // No; generate it now.
+
+    // Load in our configured paths.
+    $paths = _related_items_by_path_get_paths(TRUE);
+
+    $related_nids = array();
+
+    // If the current page is an excluded page, and the administrator has set the
+    // "don't show related content" flag, exit now.
+    if (in_array(drupal_get_path_alias($current_path_unaliased), $paths['excluded pages'])
+      && !variable_get('related_items_by_path_show_on_excluded_pages', TRUE)
+    ) {
+      return $related_nids;
+    }
+
+    // If there is an active trail back to the homepage, work our way upwards
+    // until we find a URL which matches a section page (which could include this
+    // page).
+    $active_trail = menu_get_active_trail();
+
+    // Add the current page to the trail, if it isn't already there.
+    $current_page_in_trail = FALSE;
+
+    foreach ($active_trail as $active_trail_entry) {
+      if ($active_trail_entry['href'] == $current_path_unaliased) {
+        $current_page_in_trail = TRUE;
+      }
+    }
+
+    if (!$current_page_in_trail) {
+      $active_trail[] = array(
+        'href' => $current_path_unaliased,
+      );
+    }
+
+    // Now convert all the paths to aliased paths.
+    foreach ($active_trail as &$active_trail_entry) {
+      $active_trail_entry['path'] = drupal_get_path_alias($active_trail_entry['href']);
+    }
+
+    // Reverse the array, so we can work our way forwards towards the homepage.
+    $active_trail = array_reverse($active_trail);
+
+    // Loop through each entry until we find one which matches our section
+    // homepages.
+    $current_parent_path = '';
+    foreach ($active_trail as $active_trail_entry) {
+      if (in_array($active_trail_entry['path'], $paths['parent paths'])) {
+        // We've found a top-level page, so stop searching.
+        $current_parent_path = $active_trail_entry['path'];
+        break;
+      }
+    }
+
+    // If the active trail is empty or only contains the homepage, revert to
+    // path matching, so see if any of the top-level categories' paths match
+    // the start of the current (aliased) path.
+
+    /**
+     * A bit about what happens when Drupal doesn't know where a node should
+     * go in the menu structure
+     *
+     * When menu_get_active_trail() is called for a node which doesn't have an
+     * entry in e.g. the main menu, it tends to default to returning a path
+     * whose first item is the homepage menu mlid, and the second item is the
+     * Navigation menu's default node entry, whose link_path and router_path
+     * values are both the wildcarded "node/%".
+     *
+     * Similarly (but of less relevance to this module), if we're on a /user
+     * path, the trail is likely to be <front> followed by e.g. /user/16.
+     *
+     * So, if $active_trail[0]['href'] == '<front>' and $active_trail[1]['href']
+     * matches $_GET['q'], or $active_trail[1]['link_path'] is 'user/%', or...
+     * umm, well, basically if the trail is two items, the first is <front> and
+     * the second is a node and that's is, then we fall back to path matching.
+     */
+    if (empty($current_parent_path)) {
+      // We didn't find a parent; do that path-matching thang.
+      foreach ($paths['parent paths'] as $parent_path) {
+        // To make sure that we don't match "foo/bar/baz" as the parent of
+        // "foo/bar/bazzicle", which would be wrong, we compare by adding a
+        // trailing slash, unless there isn't one already.
+        $parent_path_no_slash = $parent_path;
+
+        if (!(substr($parent_path, strlen($parent_path) - 1, 1) == '/')) {
+          $parent_path .= '/';
+        }
+
+        // Remember to compare against the aliased path.
+        if (substr($current_path_aliased, 0, strlen($parent_path)) == $parent_path) {
+          $current_parent_path = $parent_path_no_slash;
+        }
+      }
+    }
+
+    // If we're currently _on_ a parent path, and the administrator has chosen
+    // not to show related content on landing pages, we skip the building of a
+    // related items list.
+    if (!variable_get('related_items_by_path_show_on_top_level_pages', FALSE) &&
+      ($current_parent_path == $current_path_aliased)
+    ) {
+      // Do nothing.
+    }
+    // If we have a parent path, find all content whose aliased path begins with
+    // $parent_path.
+    elseif (!empty($current_parent_path)) {
+      // Get the current language.
+      global $language;
+      $language_code = $language->language;
+
+      $query = db_select('url_alias', 'ua')
+        ->fields('ua', array('source'))
+        // Only search for node paths.
+        ->condition('ua.source', db_like('node/') . '%', 'LIKE');
+
+      // If we have any exclusions, add a "NOT IN" clause now.
+      if (is_array($exclusions)) {
+        $query->condition('ua.source', $exclusions, 'NOT IN');
+      }
+
+      // Only return aliases for the current language, or those which have no
+      // language restriction.
+      $or = db_or()
+        ->condition('ua.language', LANGUAGE_NONE)
+        ->condition('ua.language', $language_code);
+
+      $query->condition($or);
+
+      // Limit the results to path aliases which begin with $parent_path (and
+      // have a slash, so we avoid that foor/bar/bazzz issue), or it matches the
+      // current parent exactly.
+      $or = db_or()
+        ->condition('ua.alias', db_like($current_parent_path) . '/%', 'LIKE')
+        ->condition('ua.alias', $current_parent_path, '=');
+
+      $query->condition($or);
+
+      $result = $query->execute();
+
+      $related_paths = array();
+
+      while ($record = $result->fetchAssoc()) {
+        // Add the related path, but only if it isn't the current page of
+        // course.
+        if (strtolower($record['source']) != strtolower($current_path_unaliased)) {
+          $related_paths[] = $record['source'];
+        }
+      }
+
+      // Have we got any related paths?
+      if (!empty($related_paths)) {
+        // Yep, so change the list of paths into a list of node IDs.
+        foreach ($related_paths as $related_path) {
+          $related_path_exploded = explode('/', $related_path);
+
+          // Double-check it's a node path, and extract the nid to $related_nids.
+          if ((count($related_path_exploded) == 2)
+            && ($related_path_exploded[0] == 'node')
+            && is_numeric($related_path_exploded[1])
+          ) {
+            $related_nids[] = $related_path_exploded[1];
+          }
+        }
+      }
+    }
+
+    // Reduce duplicates by flipping the array twice.
+    $related_nids = array_flip(array_flip($related_nids));
+
+    // If we have some items, randomly sort them, then return the first $count
+    // items.
+    if (!empty($related_nids)) {
+      shuffle($related_nids);
+    }
+
+    // Cut the array down to just the items we want.
+    if (count($related_nids) > $count) {
+      $related_nids = array_slice($related_nids, 0, $count);
+    }
+
+    // Now, for our results, get a list of title, summary text, image and path
+    // alias.
+    $nodes = node_load_multiple($related_nids);
+    $related_items = array();
+
+    foreach ($nodes as $node) {
+      $related_items[$node->nid] = related_items_by_path_get_related_item_info($node);
+    }
+
+    // Lastly, insert these results (even if empty) into the cache.
+    $related_content_by_path[$current_path_unaliased] = $related_items;
+  }
+
+  // Send 'em back :)
+  return $related_content_by_path[$current_path_unaliased];
+}
+
+/**
+ * Get the title, image and summary text for a node.
+ *
+ * @param $node
+ *
+ * @return array
+ */
+function related_items_by_path_get_related_item_info($node) {
+  // Get the image and summary (this is so long-winded. Am I doing it
+  // wrong? Le sigh...).
+
+  // Get the current language.
+  global $language;
+  $language_code = $language->language;
+
+  // Loop through the image fields which we want to consider for inclusion.
+  $image_fields = variable_get('related_items_by_path_image_fields', array('field_header_image'));
+  $selected_image = $image_uri = NULL;
+
+  foreach ($image_fields as $image_field_name) {
+    $field_images = field_get_items('node', $node, $image_field_name, $language_code);
+
+    if (is_array($field_images) && (!empty($field_images))) {
+      $selected_image = field_view_value('node', $node, $image_field_name, $field_images[0], $language_code);
+      break;
+    }
+  }
+
+  // Did we get an image? If so, format it to the correct image style.
+  if (!is_null($selected_image)) {
+    if (array_key_exists('#item', $selected_image)) {
+      $image_uri = image_style_url(variable_get('related_items_by_path_image_style'), $selected_image['#item']['uri']);
+    }
+  }
+  else {
+    // If it hasn't already been copied, copy the default blank image into
+    // the files directory with a traceable name.
+    $image_uri = 'public://' . RELATED_ITEMS_BY_PATH_IMAGE_FILESYSTEM_NAME;
+
+    if (!file_exists($image_uri)) {
+      $handle = fopen(drupal_get_path('module', 'related_items_by_path') . '/images/' . RELATED_ITEMS_BY_PATH_BLANK_IMAGE, 'r');
+      $file = file_save_data($handle, $image_uri);
+      fclose($handle);
+    }
+
+    // Create a default (blank) image.
+    $image_uri = image_style_url(variable_get('related_items_by_path_image_style'), $image_uri);
+  }
+
+  // Now we need to try and get the summary text, if any has been set.
+  $body_text_multiple = field_get_items('node', $node, 'body');
+
+  $body_text_safe_summary_tags_stripped = '';
+  if ((!empty($body_text_multiple))
+    && array_key_exists('safe_summary', $body_text_multiple[0])
+  ) {
+    $body_text_safe_summary_tags_stripped = strip_tags($body_text_multiple[0]['safe_summary']);
+  }
+
+  // Finally, build the item array.
+  $related_item = array(
+    'title' => $node->title,
+    'image' => $image_uri,
+    'summary_text' => $body_text_safe_summary_tags_stripped,
+    'path' => 'node/' . $node->nid,
+  );
+
+  return $related_item;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function related_items_by_path_menu() {
+  $items = array();
+
+  $items['admin/config/content/related-items-by-path'] = array(
+    'title' => 'Related Items Configuration',
+    'description' => 'Configure the Related Items listings by specifying which pages act as parents of sections of content.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('related_items_by_path_admin'),
+    'access arguments' => array('administer related items by path'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function related_items_by_path_permission() {
+  return array(
+    'administer related items by path' => array(
+      'title' => t('Administer Related Items By Path'),
+      'description' => t('Configure which paths on this website should be considered section homepages, and which pages should be excluded from the results.'),
+    ),
+  );
+}
+
+/**
+ * Returns a system settings form.
+ *
+ * @return mixed
+ */
+function related_items_by_path_admin() {
+  $form = array();
+
+  $form['related_items_by_path_block_title'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Title to show above any results'),
+    '#default_value' => variable_get('related_items_by_path_block_title', 'You may also like'),
+    '#description' => t('This is the heading which will be shown above any results. Leave this blank to show no title.'),
+  );
+
+  $paths = _related_items_by_path_get_paths();
+
+  $form['related_items_by_path_parent_paths'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Related content parent paths ("sections")'),
+    '#default_value' => $paths['parent paths'],
+    '#size' => 20,
+    '#description' => t('Provide a list of paths (internal URLs) which are the top-level pages for the sections of content on this site. For example, if a page on this site has the URL <em>https://www.example.com/hello/world</em>, you should enter <em>hello/world</em>. For the homepage, enter &lt;front&gt; on its own line. Do not include a slash at the start of the URL, and do not enter absolute paths (i.e. those beginning "http://www.example.com"). Related content will be selected from child pages of the closest section page above the current page in the menu.'),
+    '#required' => FALSE,
+  );
+
+  $form['related_items_by_path_image_fields'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Image fields'),
+    '#default_value' => _related_items_by_path_array_to_string(variable_get('related_items_by_path_image_fields', array('field_header_image'))),
+    '#size' => 20,
+    '#description' => t('Enter the machine names of the fields which should be checked for images, with the highest-priority image first. If the content type doesn\'t include that image field, the field will be skipped.'),
+    '#required' => TRUE,
+  );
+
+  // Get a list of available image styles.
+  $image_style_options = array();
+
+  foreach (image_styles() as $image_style) {
+    $image_style_options[$image_style['name']] = $image_style['label'] . ' (' . $image_style['name'] . ')';
+  }
+
+  $form['related_items_by_path_image_style'] = array(
+    '#type' => 'select',
+    '#title' => t('What image style should be used to display the image?'),
+    '#default_value' => variable_get('related_items_by_path_image_style', 'thumbnail'),
+    '#options' => $image_style_options,
+    '#description' => t('Select which image style should be used to display the image. Be careful not to use a style which will output very large images, as this will heavily impact the site speed for customers.'),
+    '#required' => TRUE,
+  );
+  // variable_set('related_items_by_path_image_style', 'thumbnail');
+
+  $form['related_items_by_path_excluded_pages'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Excluded pages which should never appear in the "Related content" lists'),
+    '#default_value' => $paths['excluded pages'],
+    '#size' => 10,
+    '#description' => t('Add in the paths of any pages which should not appear in "Related content" lists. Paths should be formatted the same as the top-level paths, above.'),
+    '#required' => FALSE,
+  );
+
+  $form['related_items_by_path_items_per_block'] = array(
+    '#type' => 'select',
+    '#title' => t('How many related items should be shown?'),
+    '#default_value' => variable_get('related_items_by_path_items_per_block', 4),
+    '#options' => drupal_map_assoc(range(1, 10)),
+    '#required' => TRUE,
+  );
+
+  $form['related_items_by_path_items_cache_time'] = array(
+    '#type' => 'select',
+    '#title' => t('How long should each page\'s results be kept before being recalculated?'),
+    '#default_value' => variable_get('related_items_by_path_items_cache_time', RELATED_ITEMS_BY_PATH_CACHE_TIME_DEFAULT),
+    '#options' => array(
+      1 * 60 * 15 => t('15 minutes'),
+      1 * 60 * 30 => t('30 minutes'),
+      1 * 60 * 60 => t('One hour'),
+      1 * 60 * 60 * 2 => t('Two hours'),
+      1 * 60 * 60 * 6 => t('Six hours'),
+      1 * 60 * 60 * 12 => t('Twelve hours'),
+      1 * 60 * 60 * 24 => t('One day'),
+      1 * 60 * 60 * 24 * 7 => t('One week'),
+      1 * 60 * 60 * 24 * 28 => t('Now you\'re just being silly...'),
+    ),
+    '#required' => TRUE,
+    '#description' => t('To keep the website performing quickly, the related content for each page is only calculated once in a while; you can define the interval here. We recommend a value between 15 minutes and one hour.'),
+  );
+
+  $form['related_items_by_path_show_on_excluded_pages'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Should related pages be shown when viewing an excluded page?'),
+    '#description' => t('If an excluded page is part of a section, would you like visitors to see "You may also like" listings on excluded pages?'),
+    '#default_value' => variable_get('related_items_by_path_show_on_excluded_pages', TRUE),
+  );
+
+  $form['related_items_by_path_show_on_top_level_pages'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Should related pages be shown when viewing a top-level category page?'),
+    '#description' => t('Related pages are usually shown only when viewing a destination page - for example an item of content, rather than a landing page. But you can elect to show related content on landing pages too, if you wish.'),
+    '#default_value' => variable_get('related_items_by_path_show_on_top_level_pages', FALSE),
+  );
+
+  $form['#validate'][] = 'related_items_by_path_admin_validate';
+  $form['#submit'][] = 'related_items_by_path_admin_submit';
+
+  return system_settings_form($form);
+}
+
+/**
+ * Loads any configured paths from the configuration table and sorts them before
+ * returning as a text-area friendly string, or an array, depending on the
+ * value of $return_as_array.
+ *
+ * @param bool $return_as_array
+ *
+ * @return array
+ */
+function _related_items_by_path_get_paths($return_as_array = FALSE) {
+  $parent_paths_array = (array) variable_get('related_items_by_path_parent_paths', array());
+
+  // Flip the array twice to remove duplicates.
+  $parent_paths_array = array_flip(array_flip($parent_paths_array));
+
+  sort($parent_paths_array);
+
+  $excluded_pages_array = (array) variable_get('related_items_by_path_excluded_pages', array());
+
+  // Flip the array twice to remove duplicates.
+  $excluded_pages_array = array_flip(array_flip($excluded_pages_array));
+
+  sort($excluded_pages_array);
+
+  $return_data = array(
+    'parent paths' => $return_as_array ? $parent_paths_array : _related_items_by_path_array_to_string($parent_paths_array),
+    'excluded pages' => $return_as_array ? $excluded_pages_array : _related_items_by_path_array_to_string($excluded_pages_array),
+  );
+
+  return $return_data;
+}
+
+/**
+ * Form validation handler for the administration configuration form.
+ *
+ * @param $form
+ * @param $form_state
+ */
+function related_items_by_path_admin_validate(&$form, &$form_state) {
+  // First, we validate the parent paths.
+  $validation_results = _related_items_by_path_validate_paths($form_state['values']['related_items_by_path_parent_paths']);
+
+  // Did it pass validation? If not, find out why.
+  if ($validation_results['failed validation']) {
+    // Update the contents of the parent paths text area with the highlighted
+    // paths.
+    // These don't work. Sod 'em ;) :(
+//    $form_state['values']['related_items_by_path_parent_paths'] = $validation_results['highlighted paths string'];
+//    $form['related_items_by_path_parent_paths']['#value'] = $validation_results['highlighted paths string'];
+
+    // Were there any paths which looked like external paths?
+    if (!empty($validation_results['invalid paths']['non-internal paths'])) {
+      foreach ($validation_results['invalid paths']['non-internal paths'] as $path) {
+        form_set_error('related_items_by_path_parent_paths', t('The path @path appears to link to an external website; please only enter URLs which exist on this website, without a leading slash. Please correct it or remove it to save these settings.', array('@path' => $path)));
+      }
+    }
+
+    // Were there any paths which looked like internal Drupal paths, but which
+    if (!empty($validation_results['invalid paths']['invalid internal paths'])) {
+      foreach ($validation_results['invalid paths']['invalid internal paths'] as $path) {
+        form_set_error('related_items_by_path_parent_paths', t('The path @path either doesn\'t exist, or you don\'t have access to it. Please correct it or remove it to save these settings.', array('@path' => $path)));
+      }
+    }
+  }
+  else {
+    form_set_value($form['related_items_by_path_parent_paths'], $validation_results['valid paths'], $form_state);
+  }
+
+  // Next, we validate the excluded pages.
+  $validation_results = _related_items_by_path_validate_paths($form_state['values']['related_items_by_path_excluded_pages']);
+
+  // Did it pass validation? If not, find out why.
+  if ($validation_results['failed validation']) {
+    // Update the contents of the parent paths text area with the highlighted
+    // paths.
+    // These don't work. Sod 'em ;) :(
+//    $form_state['values']['related_items_by_path_excluded_pages'] = $validation_results['highlighted paths string'];
+//    $form['#value']['related_items_by_path_excluded_pages'] = $validation_results['highlighted paths string'];
+
+    // Were there any paths which looked like external paths?
+    if (!empty($validation_results['invalid paths']['non-internal paths'])) {
+      foreach ($validation_results['invalid paths']['non-internal paths'] as $path) {
+        form_set_error('related_items_by_path_excluded_pages', t('The path @path appears to link to an external website; please only enter URLs which exist on this website, without a leading slash. Please correct it or remove it to save these settings.', array('@path' => $path)));
+      }
+    }
+
+    // Were there any paths which looked like internal Drupal paths, but which
+    if (!empty($validation_results['invalid paths']['invalid internal paths'])) {
+      foreach ($validation_results['invalid paths']['invalid internal paths'] as $path) {
+        form_set_error('related_items_by_path_excluded_pages', t('The path @path either doesn\'t exist, or you don\'t have access to it. Please correct it or remove it to save these settings.', array('@path' => $path)));
+      }
+    }
+  }
+  else {
+    form_set_value($form['related_items_by_path_excluded_pages'], $validation_results['valid paths'], $form_state);
+  }
+}
+
+/**
+ * Validation function which converts the paths string submitted by the admin
+ * settings form into an array of valid internal paths, ready to pass to
+ * _related_items_by_path_submit_paths($paths_array).
+ *
+ * @param $paths_string A string of paths, with multiple paths separated by line
+ *                      breaks.
+ *
+ * @return array A structured array containing a list of valid paths, and
+ *               invalid paths, split into those which don't look like valid
+ *               internal paths, and those which look like external paths.
+ */
+function _related_items_by_path_validate_paths($paths_string) {
+  // Convert the paths string into an array of paths.
+  $valid_paths_array = _related_items_by_path_string_to_array($paths_string);
+  $invalid_paths_array = array(
+    'non-internal paths' => array(),
+    'invalid internal paths' => array(),
+  );
+  $failed_validation = FALSE;
+  $highlighted_paths_string = '';
+
+  foreach ($valid_paths_array as $path_string) {
+    // Trim any white space.
+    $path_string = trim($path_string);
+
+    // Trim any leading or trailing slashes.
+    $path_string = trim($path_string, '/');
+
+    // Check that the path isn't an external URL.
+    if (url_is_external($path_string)) {
+      // This doesn't look like an internal URL, so add it to the list of
+      // invalid paths and continue on to the next path.
+      $path_string = '*' . $path_string;
+      $invalid_paths_array['non-internal paths'][] = $path_string;
+      $failed_validation = TRUE;
+    }
+    // Check if the path exists and the current user is allowed to access it.
+    // If not, mark it with a * at the start of the path and set an error.
+    elseif (!drupal_valid_path(drupal_get_normal_path($path_string))) {
+      // This doesn't look like a valid internal URL, so add it to the list of
+      // invalid paths and continue on to the next path.
+      $path_string = '*' . $path_string;
+      $invalid_paths_array['invalid internal paths'][] = $path_string;
+      $failed_validation = TRUE;
+    }
+    else {
+      // If we got this far, the path is valid and can be passes into the
+      // $paths_array to be passed on to the validation function.
+      $valid_paths_array[] = $path_string;
+    }
+
+    // Add the string - possibly with any highlighting - back into the
+    // $highlighted_paths_string.
+    $highlighted_paths_string .= RELATED_ITEMS_BY_PATH_LINE_ENDING . $path_string;
+  }
+
+  return array(
+    'valid paths' => $valid_paths_array,
+    'invalid paths' => $invalid_paths_array,
+    'failed validation' => $failed_validation,
+    'original paths string' => $paths_string,
+    'highlighted paths string' => $highlighted_paths_string,
+  );
+}
+
+/**
+ * Submit handler for the admin configuration form. Saves the parent paths and
+ * excluded pages data.
+ *
+ * @param $form
+ * @param $form_state
+ */
+function related_items_by_path_admin_submit($form, &$form_state) {
+  // Convert the image fields textarea to an array, trimming off any shitespace
+  // in the process and replacing any instances of "\r\n" with RELATED_ITEMS_BY_PATH_LINE_ENDING.
+  $form_state['values']['related_items_by_path_image_fields']
+    = _related_items_by_path_string_to_array($form_state['values']['related_items_by_path_image_fields']);
+
+  // Remove duplicates and sort before saving.
+  $form_state['values']['related_items_by_path_parent_paths'] = array_flip(array_flip($form_state['values']['related_items_by_path_parent_paths']));
+  sort($form_state['values']['related_items_by_path_parent_paths']);
+  $form_state['values']['related_items_by_path_excluded_pages'] = array_flip(array_flip($form_state['values']['related_items_by_path_excluded_pages']));
+  sort($form_state['values']['related_items_by_path_excluded_pages']);
+
+  $paths_array = array(
+    'parent paths' => $form_state['values']['related_items_by_path_parent_paths'],
+    'excluded pages' => $form_state['values']['related_items_by_path_excluded_pages'],
+  );
+
+  _related_items_by_path_save_paths($paths_array);
+
+  drupal_set_message(t('The configuration for Related Items by Path has been saved.'));
+}
+
+/**
+ * Saves an updated set of paths as an array.
+ *
+ * @param $paths_array
+ */
+function _related_items_by_path_save_paths($paths_array) {
+  variable_set('related_items_by_path_parent_paths', $paths_array['parent paths']);
+  variable_set('related_items_by_path_excluded_pages', $paths_array['excluded pages']);
+}
+
+/**
+ * Little helper to normalise line endings.
+ *
+ * @param $unsanitised_string
+ *
+ * @return mixed
+ */
+function _related_items_by_path_sanitise_line_endings($unsanitised_string) {
+  $unsanitised_string = str_replace("\r", RELATED_ITEMS_BY_PATH_LINE_ENDING, $unsanitised_string);
+  $sanitised_string = str_replace("\n\n", RELATED_ITEMS_BY_PATH_LINE_ENDING, $unsanitised_string);
+
+  return $sanitised_string;
+}
+
+/**
+ * Little helper to convert a string with line endings into an array.
+ *
+ * Trims whitespace off the string before exploding, to reduce empty leading/
+ * trailing values.
+ *
+ * @param $string
+ *
+ * @return array
+ */
+function _related_items_by_path_string_to_array($string) {
+  $string = trim(_related_items_by_path_sanitise_line_endings($string));
+
+  return explode(RELATED_ITEMS_BY_PATH_LINE_ENDING, $string);
+}
+
+/**
+ * Little helper to convert an array into a string with line endings.
+ *
+ * @param $array
+ *
+ * @return string
+ */
+function _related_items_by_path_array_to_string($array) {
+  return implode(RELATED_ITEMS_BY_PATH_LINE_ENDING, $array);
+}
